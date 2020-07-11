@@ -30,6 +30,8 @@
 
 #include "sjdefs.h"
 #include <cstdlib>
+#include <chrono>
+#include <ctime>
 
 #ifdef USE_LUA
 
@@ -204,7 +206,7 @@ byte* MemoryPointer=NULL;
 int macronummer = 0, lijst = 0, reglenwidth = 0;
 TextFilePos CurSourcePos, DefinitionPos;
 uint32_t maxlin = 0;
-aint CurAddress = 0, CompiledCurrentLine = 0, LastParsedLabelLine = 0;
+aint CurAddress = 0, CompiledCurrentLine = 0, LastParsedLabelLine = 0, PredefinedCounter = 0;
 aint destlen = 0, size = -1L,PreviousErrorLine = -1L, comlin = 0;
 char* CurrentDirectory=NULL;
 
@@ -250,6 +252,7 @@ void InitPass() {
 	PseudoORG = 0; adrdisp = 0; dispPageNum = LABEL_PAGE_UNDEFINED;
 	ListAddress = 0; macronummer = 0; lijst = 0; comlin = 0;
 	lijstp = NULL;
+	DidEmitByte();				// reset the emitted flag
 	StructureTable.ReInit();
 	MacroTable.ReInit();
 	MacroDefineTable.ReInit();
@@ -266,12 +269,26 @@ void InitPass() {
 	Page = NULL;
 	deviceDirectivesCounter = 0;
 
-	// predefined
+	// predefined defines - (deprecated) classic sjasmplus v1.x (till v1.15.1)
 	DefineTable.Replace("_SJASMPLUS", "1");
-	DefineTable.Replace("_VERSION", "\"" VERSION "\"");
 	DefineTable.Replace("_RELEASE", "0");
-	DefineTable.Replace("_ERRORS", "0");
-	DefineTable.Replace("_WARNINGS", "0");
+	DefineTable.Replace("_VERSION", "__VERSION__");
+	DefineTable.Replace("_ERRORS", "__ERRORS__");
+	DefineTable.Replace("_WARNINGS", "__WARNINGS__");
+	// predefined defines - sjasmplus v2.x-like (since v1.15.2)
+	// __DATE__ and __TIME__ are defined just once in main(...) (stored in Options::CmdDefineTable)
+	DefineTable.Replace("__SJASMPLUS__", VERSION_NUM);		// modified from _SJASMPLUS
+	DefineTable.Replace("__VERSION__", "\"" VERSION "\"");	// migrated from _VERSION
+	DefineTable.Replace("__ERRORS__", "0");					// migrated from _ERRORS
+	DefineTable.Replace("__WARNINGS__", "0");				// migrated from _WARNINGS
+	DefineTable.Replace("__PASS__", pass);					// current pass of assembler
+	DefineTable.Replace("__INCLUDE_LEVEL__", "-1");			// include nesting
+	DefineTable.Replace("__BASE_FILE__", "<none>");			// the include-level 0 file
+	DefineTable.Replace("__FILE__", "<none>");				// current file
+	DefineTable.Replace("__LINE__", "<dynamic value>");		// current line in current file
+	DefineTable.Replace("__COUNTER__", "<dynamic value>");	// gcc-like, incremented upon every use
+	PredefinedCounter = 0;
+
 	// resurrect "global" device here
 	if (globalDeviceID && !SetDevice(globalDeviceID, globalDeviceZxRamTop)) {
 		Error("Failed to re-initialize global device", globalDeviceID, FATAL);
@@ -605,6 +622,16 @@ int main(int argc, char **argv) {
 			sourceFiles.push_back(SSource(parsedOptsArray[i++]));
 		}
 	}
+
+	// setup __DATE__ and __TIME__ macros (setup them just once, not every pass!)
+	auto now = std::chrono::system_clock::now();
+	std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+	std::tm now_tm = *std::localtime(&now_c);	// lgtm [cpp/potentially-dangerous-function]
+	char dateBuffer[32] = {}, timeBuffer[32] = {};
+	SPRINTF3(dateBuffer, 30, "\"%04d-%02d-%02d\"", now_tm.tm_year + 1900, now_tm.tm_mon + 1, now_tm.tm_mday);
+	SPRINTF3(timeBuffer, 30, "\"%02d:%02d:%02d\"", now_tm.tm_hour, now_tm.tm_min, now_tm.tm_sec);
+	Options::CmdDefineTable.Add("__DATE__", dateBuffer, nullptr);
+	Options::CmdDefineTable.Add("__TIME__", timeBuffer, nullptr);
 
 	int i = 1;
 	if (argc > 1) {

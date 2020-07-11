@@ -349,11 +349,11 @@ void ParseAlignArguments(char* & src, aint & alignment, aint & fill) {
 
 static bool ReplaceDefineInternal(char* lp, char* const nl) {
 	int definegereplaced = 0,dr;
-	char* rp = nl,* nid,* kp,* ver;
-	bool isPrevDefDir, isCurrDefDir = false;	// to remember if one of DEFINE-related directives was previous word
+	char* rp = nl,* nid,* ver;
+	bool isDefDir = false;	// to remember if one of DEFINE-related directives was used
 	bool afterNonAlphaNum, afterNonAlphaNumNext = true;
 	char defarrayCountTxt[16] = { 0 };
-	while (*lp) {
+	while (*lp && ((rp - nl) < LINEMAX)) {
 		const char c1 = lp[0], c2 = lp[1];
 		afterNonAlphaNum = afterNonAlphaNumNext;
 		afterNonAlphaNumNext = !isalnum((byte)c1);
@@ -386,8 +386,6 @@ static bool ReplaceDefineInternal(char* lp, char* const nl) {
 
 		// strings parsing
 		if (afterNonAlphaNum && (c1 == '"' || c1 == '\'')) {
-			isPrevDefDir = isCurrDefDir;
-			isCurrDefDir = false;
 			*rp++ = *lp++;				// copy the string delimiter (" or ')
 			// apostrophe inside apostrophes ('') will parse as end + start of another string
 			// which sort of "accidentally" leads to correct final results
@@ -405,11 +403,12 @@ static bool ReplaceDefineInternal(char* lp, char* const nl) {
 			continue;
 		}
 
-		// update previous/current word is define-related directive
-		isPrevDefDir = isCurrDefDir;
-		kp = lp;
-		isCurrDefDir = afterNonAlphaNum && (cmphstr(kp, "define") || cmphstr(kp, "undefine") || cmphstr(kp, "defarray+")
+		// update "is define-related directive" for remainder of the line
+		char* kp = lp;
+		isDefDir |= afterNonAlphaNum && (cmphstr(kp, "define") || cmphstr(kp, "undefine") || cmphstr(kp, "defarray+")
 			|| cmphstr(kp, "defarray") || cmphstr(kp, "ifdef") || cmphstr(kp, "ifndef"));
+		// if DEFINE-related directive was used, only macro-arguments are substituted
+		// in the remaining part of the line, the define-based substitution is inhibited till EOL
 
 		// The following loop is recursive-like macro/define substitution, the `*lp` here points
 		// at alphabet/underscore char, marking start of "id" string, and it will be parsed by
@@ -425,7 +424,7 @@ static bool ReplaceDefineInternal(char* lp, char* const nl) {
 			const bool canSubstituteInside = '_' != nid[0] || nextSubIdLp == wholeIdLp;
 			if (macrolabp && canSubstituteInside && (ver = MacroDefineTable.getverv(nid))) {
 				dr = 2;			// macro argument substitution is possible
-			} else if (!isPrevDefDir && canSubstituteInside && (ver = DefineTable.Get(nid))) {
+			} else if (!isDefDir && canSubstituteInside && (ver = DefineTable.Get(nid))) {
 				dr = 1;			// DEFINE substitution is possible
 				//handle DEFARRAY case
 				if (DefineTable.DefArrayList) {
@@ -472,7 +471,7 @@ static bool ReplaceDefineInternal(char* lp, char* const nl) {
 			}
 			if (0 < dr) definegereplaced = 1;		// above zero => count as replacement
 			if (0 != dr) {				// any non-zero dr => write to the output
-				while (*ver) *rp++ = *ver++;		// replace the string into target buffer
+				while (*ver && ((rp - nl) < LINEMAX)) *rp++ = *ver++;		// replace the string into target buffer
 				// reset subId parser to catch second+ subId in current Id
 				ResetGrowSubId();
 				nextSubIdLp = lp;
@@ -481,8 +480,8 @@ static bool ReplaceDefineInternal(char* lp, char* const nl) {
 		} while(islabchar(*lp));
 	} // while(*lp)
 	// add line terminator to the output buffer
-	*rp = 0;
-	if (strlen(nl) > LINEMAX - 1) {
+	*rp++ = 0;
+	if (LINEMAX <= (rp - nl)) {
 		Error("line too long after macro expansion", NULL, FATAL);
 	}
 	// check if whole line is just blanks, then return just empty one

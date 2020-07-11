@@ -42,7 +42,8 @@ char * rlpbuf, * rlpbuf_end, * rlppos;
 bool colonSubline;
 int blockComment;
 
-int EB[1024 * 64],nEB = 0;
+constexpr int LIST_EMIT_BYTES_BUFFER_SIZE = 1024 * 64;
+int ListEmittedBytes[LIST_EMIT_BYTES_BUFFER_SIZE], nListBytes = 0;
 char WriteBuffer[DESTBUFLEN];
 int tape_seek = 0;
 int tape_length = 0;
@@ -124,7 +125,7 @@ void Error(const char* message, const char* badValueMessage, EStatus type) {
 	PreviousErrorLine = CompiledCurrentLine;
 	++ErrorCount;							// number of non-skipped (!) errors
 
-	DefineTable.Replace("_ERRORS", ErrorCount);
+	DefineTable.Replace("__ERRORS__", ErrorCount);
 
 	initErrorLine();
 	STRCAT(ErrorLine, LINEMAX2-1, "error: ");
@@ -168,7 +169,7 @@ void Warning(const char* message, const char* badValueMessage, EWStatus type)
 
 	++WarningCount;
 
-	DefineTable.Replace("_WARNINGS", WarningCount);
+	DefineTable.Replace("__WARNINGS__", WarningCount);
 
 	initErrorLine();
 	STRCAT(ErrorLine, LINEMAX2-1, "warning: ");
@@ -354,7 +355,7 @@ FILE* GetListingFile() {
 
 void ListFile(bool showAsSkipped) {
 	if (LASTPASS != pass || NULL == GetListingFile() || donotlist || Options::syx.IsListingSuspended) {
-		donotlist = nEB = 0;
+		donotlist = nListBytes = 0;
 		return;
 	}
 	int pos = 0;
@@ -363,25 +364,25 @@ void ListFile(bool showAsSkipped) {
 		PrepareListLine(pline, ListAddress);
 		if (pos) pline[24] = 0;		// remove source line on sub-sequent list-lines
 		char* pp = pline + 10;
-		int BtoList = (nEB < 4) ? nEB : 4;
+		int BtoList = (nListBytes < 4) ? nListBytes : 4;
 		for (int i = 0; i < BtoList; ++i) {
-			if (-2 == EB[i + pos]) pp += sprintf(pp, "...");
-			else pp += sprintf(pp, " %02X", EB[i + pos]);
+			if (-2 == ListEmittedBytes[i + pos]) pp += sprintf(pp, "...");
+			else pp += sprintf(pp, " %02X", ListEmittedBytes[i + pos]);
 		}
 		*pp = ' ';
 		if (showAsSkipped) pline[11] = '~';
 		ListFileStringRtrim();
 		fputs(pline, GetListingFile());
-		nEB -= BtoList;
+		nListBytes -= BtoList;
 		ListAddress += BtoList;
 		pos += BtoList;
-	} while (0 < nEB);
-	nEB = 0;
+	} while (0 < nListBytes);
+	nListBytes = 0;
 }
 
 void ListSilentOrExternalEmits() {
 	// catch silent/external emits like "sj.add_byte(0x123)" from Lua script
-	if (0 == nEB) return;		// no silent/external emit happened
+	if (0 == nListBytes) return;		// no silent/external emit happened
 	char silentOrExternalBytes[] = "; these bytes were emitted silently/externally (lua script?)";
 	substitutedLine = silentOrExternalBytes;
 	eolComment = nullptr;
@@ -389,7 +390,16 @@ void ListSilentOrExternalEmits() {
 	substitutedLine = line;
 }
 
+static bool someByteEmitted = false;
+
+bool DidEmitByte() {	// returns true if some byte was emitted since last call to this function
+	bool didEmit = someByteEmitted;		// value to return
+	someByteEmitted = false;			// reset the flag
+	return didEmit;
+}
+
 static void EmitByteNoListing(int byte, bool preserveDeviceMemory = false) {
+	someByteEmitted = true;
 	if (LASTPASS == pass) {
 		WriteBuffer[WBLength++] = (char)byte;
 		if (DESTBUFLEN == WBLength) WriteDest();
@@ -410,7 +420,14 @@ static void EmitByteNoListing(int byte, bool preserveDeviceMemory = false) {
 
 void EmitByte(int byte) {
 	byte &= 0xFF;
-	EB[nEB++] = byte;		// write also into listing
+	if (nListBytes < LIST_EMIT_BYTES_BUFFER_SIZE-1) {
+		ListEmittedBytes[nListBytes++] = byte;		// write also into listing
+	} else {
+		if (nListBytes < LIST_EMIT_BYTES_BUFFER_SIZE) {
+			// too many bytes, show it in listing as "..."
+			ListEmittedBytes[nListBytes++] = -2;
+		}
+	}
 	EmitByteNoListing(byte);
 }
 
@@ -439,13 +456,16 @@ void EmitBlock(aint byte, aint len, bool preserveDeviceMemory, int emitMaxToList
 		else			CheckRamLimitExceeded();
 		return;
 	}
+	if (LIST_EMIT_BYTES_BUFFER_SIZE <= nListBytes + emitMaxToListing) {	// clamp emit to list buffer
+		emitMaxToListing = LIST_EMIT_BYTES_BUFFER_SIZE - nListBytes;
+	}
 	while (len--) {
 		int dVal = (preserveDeviceMemory && DeviceID && MemoryPointer) ? MemoryPointer[0] : byte;
 		EmitByteNoListing(byte, preserveDeviceMemory);
 		if (LASTPASS == pass && emitMaxToListing) {
 			// put "..." marker into listing if some more bytes are emitted after last listed
-			if ((0 == --emitMaxToListing) && len) EB[nEB++] = -2;
-			else EB[nEB++] = dVal&0xFF;
+			if ((0 == --emitMaxToListing) && len) ListEmittedBytes[nListBytes++] = -2;
+			else ListEmittedBytes[nListBytes++] = dVal&0xFF;
 		}
 	}
 }
@@ -590,6 +610,11 @@ void OpenFile(const char* nfilename, bool systemPathsBeforeCurrent, stdin_log_t*
 	fileNameFull = ofnIt->c_str();				// get const pointer into archive
 	CurSourcePos.newFile(Options::IsShowFullPath ? fileNameFull : FilenameBasePos(fileNameFull));
 
+	// refresh pre-defined values related to file/include
+	DefineTable.Replace("__INCLUDE_LEVEL__", IncludeLevel);
+	DefineTable.Replace("__FILE__", fileNameFull);
+	if (0 == IncludeLevel) DefineTable.Replace("__BASE_FILE__", fileNameFull);
+
 	// open default listing file for each new source file (if default listing is ON)
 	if (LASTPASS == pass && 0 == IncludeLevel && Options::IsDefaultListingName) {
 		OpenDefaultList(fullpath);			// explicit listing file is already opened
@@ -645,6 +670,11 @@ void OpenFile(const char* nfilename, bool systemPathsBeforeCurrent, stdin_log_t*
 	}
 	fileNameFull = oFileNameFull;
 	CurSourcePos = oSourcePos;
+
+	// refresh pre-defined values related to file/include
+	DefineTable.Replace("__INCLUDE_LEVEL__", IncludeLevel);
+	DefineTable.Replace("__FILE__", fileNameFull ? fileNameFull : "<none>");
+	if (-1 == IncludeLevel) DefineTable.Replace("__BASE_FILE__", "<none>");
 }
 
 void IncludeFile(const char* nfilename, bool systemPathsBeforeCurrent)
