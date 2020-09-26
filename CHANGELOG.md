@@ -1,3 +1,18 @@
+## [1.17.0](https://github.com/z00m128/sjasmplus/releases/tag/v1.17.0) - 8.8.2020
+- `STRUCT` has new [`TEXT`](http://z00m128.github.io/sjasmplus/documentation.html#st_text) pseudo-instruction to define "DB-like" data
+- [`STRUCT` initializer block](http://z00m128.github.io/sjasmplus/documentation.html#st_usage) can be now multi-line (when correctly enclosed in curly braces)
+- [`EQU`](http://z00m128.github.io/sjasmplus/documentation.html#po_equ) now allows for optional override of page number assigned to the new symbol
+- new [$$$ and $$$$ operators](http://z00m128.github.io/sjasmplus/documentation.html#s_expressions) to retrieve "physical" address/page inside DISP block
+- instruction `out (c),0` now emits warning (can be suppressed by the "; ok" comment)
+- fixed listing of structures using long BLOCK fields (machine code was correct, but listing not)
+- fixed some memory leaks, undefined behaviour and unaligned memory access
+
+## [1.16.0](https://github.com/z00m128/sjasmplus/releases/tag/v1.16.0) - 27.7.2020
+- `LUA` the new emit warning (v1.15.1) is now suppressible
+- Predefined defines extended and renamed (following gcc/clang ones)
+- Added [relocation data generator](http://z00m128.github.io/sjasmplus/documentation.html#po_relocate_end), check also [example](https://github.com/z00m128/sjasmplus/tree/master/examples/relocation)
+- bugfixes/improvements in parser like: operators `not`, `low`, `high` can be followed also by `(`
+
 ## [1.15.1](https://github.com/z00m128/sjasmplus/releases/tag/v1.15.1) - 7.7.2020
 - `EQU` now assigns memory page to symbol based on the symbol value and current memory mapping
 - this does affect also results of `LABELSLIST` (Issue #111)

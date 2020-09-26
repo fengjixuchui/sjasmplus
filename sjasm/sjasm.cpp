@@ -108,6 +108,7 @@ namespace Options {
 	bool IsI8080 = false;
 	bool IsLR35902 = false;
 	bool IsLongPtr = false;
+	bool EmitVirtualLabels = false;
 
 	// Include directories list is initialized with "." directory
 	CStringsList* IncludeDirsList = new CStringsList(".");
@@ -199,9 +200,10 @@ std::vector<std::string> openedFileNames;
 
 int ConvertEncoding = ENCWIN;
 
+EDispMode PseudoORG = DISP_NONE;
 int pass = 0, IsLabelNotFound = 0, ErrorCount = 0, WarningCount = 0, IncludeLevel = -1;
 int IsRunning = 0, donotlist = 0, listmacro = 0;
-int adrdisp = 0, PseudoORG = 0, dispPageNum = LABEL_PAGE_UNDEFINED, StartAddress = -1;
+int adrdisp = 0, dispPageNum = LABEL_PAGE_UNDEFINED, StartAddress = -1;
 byte* MemoryPointer=NULL;
 int macronummer = 0, lijst = 0, reglenwidth = 0;
 TextFilePos CurSourcePos, DefinitionPos;
@@ -232,6 +234,7 @@ static char* globalDeviceID = NULL;
 static aint globalDeviceZxRamTop = 0;
 
 void InitPass() {
+	Relocation::InitPass();
 	Options::SSyntax::restoreSystemSyntax();	// release all stored syntax variants and reset to initial
 	uint32_t maxpow10 = 1;
 	reglenwidth = 0;
@@ -249,7 +252,7 @@ void InitPass() {
 	CurAddress = 0;
 	CurSourcePos = DefinitionPos = TextFilePos();	// reset current source/definition positions
 	CompiledCurrentLine = 0;
-	PseudoORG = 0; adrdisp = 0; dispPageNum = LABEL_PAGE_UNDEFINED;
+	PseudoORG = DISP_NONE; adrdisp = 0; dispPageNum = LABEL_PAGE_UNDEFINED;
 	ListAddress = 0; macronummer = 0; lijst = 0; comlin = 0;
 	lijstp = NULL;
 	DidEmitByte();				// reset the emitted flag
@@ -275,7 +278,7 @@ void InitPass() {
 	DefineTable.Replace("_VERSION", "__VERSION__");
 	DefineTable.Replace("_ERRORS", "__ERRORS__");
 	DefineTable.Replace("_WARNINGS", "__WARNINGS__");
-	// predefined defines - sjasmplus v2.x-like (since v1.15.2)
+	// predefined defines - sjasmplus v2.x-like (since v1.16.0)
 	// __DATE__ and __TIME__ are defined just once in main(...) (stored in Options::CmdDefineTable)
 	DefineTable.Replace("__SJASMPLUS__", VERSION_NUM);		// modified from _SJASMPLUS
 	DefineTable.Replace("__VERSION__", "\"" VERSION "\"");	// migrated from _VERSION
@@ -717,8 +720,15 @@ int main(int argc, char **argv) {
 			OpenFile(src.fname, false, src.stdin_log);
 		}
 
-		if (PseudoORG) {
-			CurAddress = adrdisp; PseudoORG = 0;
+		while (!RepeatStack.empty()) {
+			CurSourcePos = RepeatStack.top().sourcePos;	// fake source-file position to mark DUP line
+			Error("[DUP/REPT] missing EDUP/ENDR to end repeat-block");
+			RepeatStack.pop();
+		}
+
+		if (DISP_NONE != PseudoORG) {
+			CurAddress = adrdisp;
+			PseudoORG = DISP_NONE;
 		}
 
 		if (Options::OutputVerbosity <= OV_ALL) {

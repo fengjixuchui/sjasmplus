@@ -82,7 +82,7 @@ char* ValidateLabel(const char* naam, bool setNameSpace) {
 	else if (local) labelLen += 1 + strlen(vorlabp);
 	if (inModule) labelLen += 1 + strlen(ModuleName);
 	// build fully qualified label name (in newly allocated memory buffer, with precise length)
-	char* label = new char[1+labelLen];
+	char* const label = new char[1+labelLen];
 	if (nullptr == label) ErrorOOM();
 	label[0] = 0;
 	if (inModule) {
@@ -110,8 +110,8 @@ static bool getLabel_invalidName = false;
 
 static CLabelTableEntry* GetLabel(char*& p) {
 	getLabel_invalidName = true;
-	char* fullName = ValidateLabel(p, false);
-	if (nullptr == fullName) return nullptr;
+	std::unique_ptr<char[]> fullName(ValidateLabel(p, false));
+	if (!fullName) return nullptr;
 	getLabel_invalidName = false;
 	const bool global = '@' == *p;
 	const bool local = '.' == *p;
@@ -121,7 +121,7 @@ static CLabelTableEntry* GetLabel(char*& p) {
 	// find the label entry in the label table (for local macro labels it has to try all sub-parts!)
 	// then regular full label has to be tried
 	// and if it's regular non-local in module, then variant w/o current module has to be tried
-	char *findName = fullName;
+	char *findName = fullName.get();
 	bool inTableAlready = false;
 	CLabelTableEntry* labelEntry = nullptr;
 	temp[0] = 0;
@@ -132,7 +132,6 @@ static CLabelTableEntry* GetLabel(char*& p) {
 			if (LASTPASS != pass) labelEntry->used = true;
 			if (LABEL_PAGE_UNDEFINED != labelEntry->page) break;
 			labelEntry = nullptr;
-			IsLabelNotFound = 2;
 		}
 		// not found (the defined one, try more variants)
 		if (inMacro) {				// try outer macro (if there is one)
@@ -148,9 +147,9 @@ static CLabelTableEntry* GetLabel(char*& p) {
 				findName = temp;
 			}
 		} else {
-			if (!global && !local && fullName == findName && modNameLen) {
+			if (!global && !local && fullName.get() == findName && modNameLen) {
 				// this still may be global label without current module (but author didn't use "@")
-				findName = fullName + modNameLen + 1;
+				findName = fullName.get() + modNameLen + 1;
 			} else {
 				findName = nullptr;	// all options exhausted
 			}
@@ -158,14 +157,15 @@ static CLabelTableEntry* GetLabel(char*& p) {
 	} while (findName);
 	if (nullptr == findName) {		// not found, check if it needs to be inserted into table
 		// canonical name is either in "temp" (when in-macro) or in "fullName" (outside macro)
-		findName = temp[0] ? temp : fullName;
+		findName = temp[0] ? temp : fullName.get();
 		if (!inTableAlready) {
 			LabelTable.Insert(findName, 0, true);
 			IsLabelNotFound = 1;
+		} else {
+			IsLabelNotFound = 2;
 		}
-		Error("Label not found", findName);
+		Error("Label not found", findName, IF_FIRST);
 	}
-	delete[] fullName;
 	return labelEntry;
 }
 
@@ -179,7 +179,14 @@ bool GetLabelPage(char*& p, aint& val) {
 
 bool GetLabelValue(char*& p, aint& val) {
 	CLabelTableEntry* labelEntry = GetLabel(p);
-	val = labelEntry ? labelEntry->value : 0;
+	if (labelEntry) {
+		val = labelEntry->value;
+		if (labelEntry->isRelocatable && Relocation::areLabelsOffset) {
+			val += Relocation::ALTERNATIVE_OFFSET;
+		}
+	} else {
+		val = 0;
+	}
 	// true even when not found, but valid label name (neeed for expression-eval logic)
 	return !getLabel_invalidName;
 }
@@ -197,11 +204,13 @@ int GetLocalLabelValue(char*& op, aint& val) {
 	if (!GetNumericValue_IntBased(op = numberB, p, val, 10)) return 0;
 	++op;
 	// ^^ advance main parsing pointer op beyond the local label (here it *is* local label)
-	val = ('b' == type) ? LocalLabelTable.seekBack(val) : LocalLabelTable.seekForward(val);
-	if (-1L == val) {
-		Error("Local label not found", numberB, SUPPRESS);
+	auto label = ('b' == type) ? LocalLabelTable.seekBack(val) : LocalLabelTable.seekForward(val);
+	if (label) {
+		val = label->value;
+		Relocation::isResultAffected = Relocation::isRelocatable = label->isRelocatable;
+	} else {
+		if (LASTPASS == pass) Error("Local label not found", numberB, SUPPRESS);
 		val = 0L;
-		return 1;
 	}
 	return 1;
 }
@@ -212,7 +221,7 @@ void CLabelTableEntry::ClearData() {
 	value = 0;
 	updatePass = 0;
 	page = LABEL_PAGE_UNDEFINED;
-	IsDEFL = IsEQU = used = false;
+	IsDEFL = IsEQU = used = isRelocatable = false;
 }
 
 CLabelTableEntry::CLabelTableEntry() : name(NULL) {
@@ -229,13 +238,13 @@ static short getAddressPageNumber(const aint address, bool forceRecalculateByAdd
 	// fast-shortcut for regular labels in current slot (if they fit into it)
 	auto slot = Device->GetCurrentSlot();
 	assert(Page && slot);
-	if (!forceRecalculateByAddress && !PseudoORG) {
+	if (!forceRecalculateByAddress && DISP_NONE == PseudoORG) {
 		if (slot->Address <= address && address < slot->Address + slot->Size) {
 			return Page->Number;
 		}
 	}
 	// enforce explicit request of fake DISP page
-	if (PseudoORG && LABEL_PAGE_UNDEFINED != dispPageNum) {
+	if (DISP_NONE != PseudoORG && LABEL_PAGE_UNDEFINED != dispPageNum) {
 		return dispPageNum;
 	}
 	// in other case (implicit DISP, out-of-slot-bounds or forceRecalculateByAddress)
@@ -245,11 +254,16 @@ static short getAddressPageNumber(const aint address, bool forceRecalculateByAdd
 	return page;
 }
 
-int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsDEFL, bool IsEQU) {
+int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsDEFL, bool IsEQU, short equPageNum) {
 	if (NextLocation >= LABTABSIZE * 2 / 3) {
 		Error("Label table full", NULL, FATAL);
 	}
 
+	// the EQU/DEFL is relocatable when the expression itself is relocatable
+	// the regular label is relocatable when relocation is active
+	const bool isRelocatable = (IsDEFL || IsEQU) ? \
+			Relocation::isResultAffected && Relocation::isRelocatable : \
+			Relocation::isActive && DISP_INSIDE_RELOCATE != PseudoORG;
 	// Find label in label table
 	CLabelTableEntry* label = Find(nname);
 	if (label) {
@@ -258,9 +272,14 @@ int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsD
 		} else {
 			//if label already added (as used, or in previous pass), just refresh values
 			label->value = nvalue;
-			label->page = getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+			if (IsEQU && LABEL_PAGE_UNDEFINED != equPageNum) {
+				label->page = equPageNum;
+			} else {
+				label->page = getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+			}
 			label->IsDEFL = IsDEFL;
 			label->IsEQU = IsEQU;
+			label->isRelocatable = isRelocatable;
 			label->updatePass = pass;
 			return 1;
 		}
@@ -278,7 +297,12 @@ int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsD
 	label->updatePass = pass;
 	label->value = nvalue;
 	label->used = undefined;
-	label->page = undefined ? LABEL_PAGE_UNDEFINED : getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+	if (IsEQU && LABEL_PAGE_UNDEFINED != equPageNum) {
+		label->page = equPageNum;
+	} else {
+		label->page = undefined ? LABEL_PAGE_UNDEFINED : getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+	}
+	label->isRelocatable = !undefined && isRelocatable;		// ignore "relocatable" for "undefined"
 	return 1;
 }
 
@@ -365,9 +389,10 @@ void CLabelTable::DumpForUnreal() {
 		Error("Error opening file", Options::UnrealLabelListFName, FATAL);
 	}
 	const int PAGE_MASK = DeviceID ? Device->GetPage(0)->Size - 1 : 0x3FFF;
+	const int ADR_MASK = Options::EmitVirtualLabels ? 0xFFFF : PAGE_MASK;
 	for (int i = 1; i < NextLocation; ++i) {
 		if (LABEL_PAGE_UNDEFINED == LabelTable[i].page) continue;
-		int page = LabelTable[i].page;
+		int page = Options::EmitVirtualLabels ? LABEL_PAGE_OUT_OF_BOUNDS : LabelTable[i].page;
 		if (!strcmp(DeviceID, "ZXSPECTRUM48") && page < 4) {	//TODO fix this properly?
 			// convert pages {0, 1, 2, 3} of ZX48 into ZX128-like {ROM, 5, 2, 0}
 			// this can be fooled when there were multiple devices used, Label doesn't know into
@@ -375,11 +400,13 @@ void CLabelTable::DumpForUnreal() {
 			const int fakeZx128Pages[] = {LABEL_PAGE_ROM, 5, 2, 0};
 			page = fakeZx128Pages[page];
 		}
-		int lvalue = LabelTable[i].value & PAGE_MASK;
+		int lvalue = LabelTable[i].value & ADR_MASK;
 		ep = ln;
+
 		if (page < LABEL_PAGE_ROM) ep += sprintf(ep, "%02d", page&255);
 		*(ep++) = ':';
 		PrintHexAlt(ep, lvalue);
+
 		*(ep++) = ' ';
 		STRCPY(ep, LINEMAX-(ep-ln), LabelTable[i].name);
 		STRCAT(ep, LINEMAX, "\n");
@@ -542,6 +569,7 @@ int CFunctionTable::Hash(const char* s) {
 CLocalLabelTableEntry::CLocalLabelTableEntry(aint number, aint address, CLocalLabelTableEntry* previous) {
 	nummer = number;
 	value = address;
+	isRelocatable = Relocation::isActive;
 	prev = previous; next = NULL;
 	if (previous) previous->next = this;
 }
@@ -581,18 +609,18 @@ bool CLocalLabelTable::InsertRefresh(const aint nnummer) {
 	return (1 == pass) ? insertImpl(nnummer) : refreshImpl(nnummer);
 }
 
-aint CLocalLabelTable::seekForward(const aint labelNumber) const {
-	if (1 == pass) return 0;			// just building tables in first pass, no results yet
+CLocalLabelTableEntry* CLocalLabelTable::seekForward(const aint labelNumber) const {
+	if (1 == pass) return nullptr;		// just building tables in first pass, no results yet
 	CLocalLabelTableEntry* l = refresh;	// already points on first "forward" local label
 	while (l && l->nummer != labelNumber) l = l->next;
-	return l ? l->value : -1L;
+	return l;
 }
 
-aint CLocalLabelTable::seekBack(const aint labelNumber) const {
-	if (1 == pass) return 0;			// just building tables in first pass, no results yet
+CLocalLabelTableEntry* CLocalLabelTable::seekBack(const aint labelNumber) const {
+	if (1 == pass) return nullptr;		// just building tables in first pass, no results yet
 	CLocalLabelTableEntry* l = refresh ? refresh->prev : last;
 	while (l && l->nummer != labelNumber) l = l->prev;
-	return l ? l->value : -1L;
+	return l;
 }
 
 CStringsList::CStringsList() : string(NULL), next(NULL)
@@ -612,7 +640,6 @@ CDefineTableEntry::CDefineTableEntry(const char* nname, const char* nvalue, CStr
 	value = new char[strlen(nvalue) + 1];
 	if (NULL == name || NULL == value) ErrorOOM();
 	char* s1 = value;
-	while (White(*nvalue)) ++nvalue;
 	while (*nvalue && *nvalue != '\n' && *nvalue != '\r') *s1++ = *nvalue++;
 	*s1 = 0;
 	next = nnext;
@@ -937,6 +964,7 @@ int CMacroTable::Emit(char* naam, char*& p) {
 		lijstp = lijstp->next;
 		ParseLineSafe();
 	}
+	++CompiledCurrentLine;
 	DefinitionPos = TextFilePos();
 	STRCPY(line, LINEMAX, ml);
 	lijstp = olijstp;
@@ -960,36 +988,65 @@ CStructureEntry1::~CStructureEntry1() {
 }
 
 
-CStructureEntry2::CStructureEntry2(aint noffset, aint nlen, aint ndef, EStructureMembers ntype) {
-	next = 0; offset = noffset; len = nlen; def = ndef; type = ntype;
+CStructureEntry2::CStructureEntry2(aint noffset, aint nlen, aint ndef, bool ndefrel, EStructureMembers ntype) :
+	next(nullptr), text(nullptr), offset(noffset), len(nlen), def(ndef), defRelocatable(ndefrel), type(ntype)
+{
+}
+
+CStructureEntry2::CStructureEntry2(aint noffset, aint nlen, byte* textData) :
+	next(nullptr), text(textData), offset(noffset), len(nlen), def(0), defRelocatable(false), type(SMEMBTEXT)
+{
+	assert(1 <= len && len <= TEXT_MAX_SIZE && nullptr != text);
 }
 
 CStructureEntry2::~CStructureEntry2() {
 	if (next) delete next;
+	if (text) delete[] text;
 }
 
 // Parses source input for types: BYTE, WORD, DWORD, D24
 aint CStructureEntry2::ParseValue(char* & p) {
 	if (SMEMBBYTE != type && SMEMBWORD != type && SMEMBDWORD != type && SMEMBD24 != type) return def;
 	SkipBlanks(p);
-	if ('{' == *p) return def;	// unexpected {
-	aint val;
-	if (!ParseExpressionNoSyntaxError(p, val)) val = def;
-	switch (type) {
-		case SMEMBBYTE:
-			check8(val);
-			return(val & 0xFF);
-		case SMEMBWORD:
-			check16(val);
-			return(val & 0xFFFF);
-		case SMEMBD24:
-			check24(val);
-			return(val & 0xFFFFFF);
-		case SMEMBDWORD:
-			return val;
-		default:
-			return def;
+	aint val = def;
+	bool keepRelocatableFlags = false;	// keep flags from the ParseExpressionNoSyntaxError?
+	// check for unexpected {
+	if ('{' != *p) {
+		if (!(keepRelocatableFlags = ParseExpressionNoSyntaxError(p, val))) {
+			val = def;
+		}
+		switch (type) {
+			case SMEMBBYTE:
+				check8(val);
+				val &= 0xFF;
+				break;
+			case SMEMBWORD:
+				check16(val);
+				val &= 0xFFFF;
+				break;
+			case SMEMBD24:
+				check24(val);
+				val &= 0xFFFFFF;
+				break;
+			case SMEMBDWORD:
+				break;
+			default:
+				break;
+		}
 	}
+	if (!Relocation::isActive) return val;
+	if (SMEMBWORD == type) {
+		if (!keepRelocatableFlags) {	// override flags, if parse expression was not successful
+			Relocation::isResultAffected |= defRelocatable;
+			Relocation::isRelocatable = defRelocatable;
+		}
+		if (Relocation::isResultAffected) {
+			Relocation::resolveRelocationAffected(0);
+		}
+	} else {
+		Relocation::checkAndWarn();
+	}
+	return val;
 }
 
 CStructure::CStructure(const char* nnaam, char* nid, int no, int ngl, CStructure* p) {
@@ -1042,38 +1099,68 @@ void CStructure::CopyLabels(CStructure* st) {
 	}
 }
 
-void CStructure::CopyMember(CStructureEntry2* ni, aint ndef) {
-	AddMember(new CStructureEntry2(noffset, ni->len, ndef, ni->type));
+void CStructure::CopyMember(CStructureEntry2* item, aint newDefault, bool newDefIsRelative) {
+	AddMember(new CStructureEntry2(noffset, item->len, newDefault, newDefIsRelative, item->type));
 }
 
 void CStructure::CopyMembers(CStructure* st, char*& lp) {
 	aint val;
 	int haakjes = 0;
-	AddMember(new CStructureEntry2(noffset, 0, 0, SMEMBPARENOPEN));
+	AddMember(new CStructureEntry2(noffset, 0, 0, false, SMEMBPARENOPEN));
 	SkipBlanks(lp);
 	if (*lp == '{') {
 		++haakjes; ++lp;
 	}
 	CStructureEntry2* ip = st->mbf;
-	while (ip) {
+	while (ip || 0 < haakjes) {
+		Relocation::isResultAffected = false;
+		// check if inside curly braces block, and input seems to be empty -> fetch next line
+		if (0 < haakjes && !PrepareNonBlankMultiLine(lp)) break;
+		if (nullptr == ip) {	// no more struct members expected, looking for closing '}'
+			assert(0 < haakjes);
+			if (!need(lp, '}')) break;
+			--haakjes;
+			continue;
+		}
+		assert(ip);
 		switch (ip->type) {
 		case SMEMBBLOCK:
-			CopyMember(ip, ip->def);
+			CopyMember(ip, ip->def, false);
 			break;
 		case SMEMBBYTE:
 		case SMEMBWORD:
 		case SMEMBD24:
 		case SMEMBDWORD:
-			if (!ParseExpressionNoSyntaxError(lp, val)) val = ip->def;
-			CopyMember(ip, val);
-			if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(lp);
+			{
+				bool isRelocatable = false;
+				if (ParseExpressionNoSyntaxError(lp, val)) {
+					isRelocatable = SMEMBWORD == ip->type && Relocation::isResultAffected && Relocation::isRelocatable;
+				} else {
+					val = ip->def;
+					isRelocatable = ip->defRelocatable;
+				}
+				CopyMember(ip, val, isRelocatable);
+				if (SMEMBWORD == ip->type) {
+					Relocation::resolveRelocationAffected(INT_MAX);	// clear flags + warn when can't be relocated
+				}
+				if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(lp);
+			}
+			break;
+		case SMEMBTEXT:
+			{
+				byte* textData = new byte[ip->len]();	// zero initialized for stable binary results
+				if (nullptr == textData) ErrorOOM();
+				GetStructText(lp, ip->len, textData, ip->text);
+				AddMember(new CStructureEntry2(noffset, ip->len, textData));
+				if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(lp);
+			}
 			break;
 		case SMEMBPARENOPEN:
 			SkipBlanks(lp);
 			if (*lp == '{') {
 				++haakjes; ++lp;
 			}
-			CopyMember(ip, 0);
+			CopyMember(ip, 0, false);
 			break;
 		case SMEMBPARENCLOSE:
 			SkipBlanks(lp);
@@ -1081,22 +1168,24 @@ void CStructure::CopyMembers(CStructure* st, char*& lp) {
 				--haakjes; ++lp;
 				if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(lp);
 			}
-			CopyMember(ip, 0);
+			CopyMember(ip, 0, false);
 			break;
 		default:
 			Error("internalerror CStructure::CopyMembers", NULL, FATAL);
 		}
+		Relocation::checkAndWarn();
 		ip = ip->next;
 	}
-	while (haakjes--) {
-		if (!need(lp, '}')) Error("closing } missing");
+	if (haakjes) {
+		Error("closing } missing");
 	}
-	AddMember(new CStructureEntry2(noffset, 0, 0, SMEMBPARENCLOSE));
+	AddMember(new CStructureEntry2(noffset, 0, 0, false, SMEMBPARENCLOSE));
 }
 
-static void InsertSingleStructLabel(char *name, const aint value) {
-	char *op = name, *p;
-	if (!(p = ValidateLabel(op, true))) {
+static void InsertSingleStructLabel(char *name, const bool isRelocatable, const aint value) {
+	char *op = name;
+	std::unique_ptr<char[]> p(ValidateLabel(op, true));
+	if (!p) {
 		Error("Illegal labelname", op, EARLY);
 		return;
 	}
@@ -1106,21 +1195,21 @@ static void InsertSingleStructLabel(char *name, const aint value) {
 			Error("Internal error. ParseLabel()", op, FATAL);
 		}
 		if (value != oval) {
-			Error("Label has different value in pass 2", p);
+			Error("Label has different value in pass 2", p.get());
 		}
 	} else {
-		if (!LabelTable.Insert(p, value, false, false, true)) Error("Duplicate label", p, EARLY);
+		Relocation::isResultAffected = Relocation::isRelocatable = isRelocatable;
+		if (!LabelTable.Insert(p.get(), value, false, false, true)) Error("Duplicate label", p.get(), EARLY);
 	}
-	delete[] p;
 }
 
-static void InsertStructSubLabels(const char* mainName, const CStructureEntry1* members, const aint address = 0) {
+static void InsertStructSubLabels(const char* mainName, const bool isRelocatable, const CStructureEntry1* members, const aint address = 0) {
 	char ln[LINEMAX+1];
 	STRCPY(ln, LINEMAX, mainName);
 	char * const lnsubw = ln + strlen(ln);
 	while (members) {
 		STRCPY(lnsubw, LINEMAX-strlen(ln), members->naam);		// overwrite sub-label part
-		InsertSingleStructLabel(ln, members->offset + address);
+		InsertSingleStructLabel(ln, isRelocatable, members->offset + address);
 		members = members->next;
 	}
 }
@@ -1128,12 +1217,12 @@ static void InsertStructSubLabels(const char* mainName, const CStructureEntry1* 
 void CStructure::deflab() {
 	char sn[LINEMAX] = { '@' };
 	STRCPY(sn+1, LINEMAX-1, id);
-	InsertSingleStructLabel(sn, noffset);
+	InsertSingleStructLabel(sn, false, noffset);
 	STRCAT(sn, LINEMAX-1, ".");
-	InsertStructSubLabels(sn, mnf);
+	InsertStructSubLabels(sn, false, mnf);
 }
 
-void CStructure::emitlab(char* iid, aint address) {
+void CStructure::emitlab(char* iid, aint address, const bool isRelocatable) {
 	const aint misalignment = maxAlignment ? ((-address) & (maxAlignment - 1)) : 0;
 	if (misalignment) {
 		// emitting in misaligned position (considering the ALIGN used to define this struct)
@@ -1145,12 +1234,13 @@ void CStructure::emitlab(char* iid, aint address) {
 	}
 	char sn[LINEMAX];
 	STRCPY(sn, LINEMAX-1, iid);
-	InsertSingleStructLabel(sn, address);
+	InsertSingleStructLabel(sn, isRelocatable, address);
 	STRCAT(sn, LINEMAX-1, ".");
-	InsertStructSubLabels(sn, mnf, address);
+	InsertStructSubLabels(sn, isRelocatable, mnf, address);
 }
 
 void CStructure::emitmembs(char*& p) {
+	byte* emitTextBuffer = nullptr;
 	aint val;
 	int haakjes = 0;
 	SkipBlanks(p);
@@ -1158,16 +1248,31 @@ void CStructure::emitmembs(char*& p) {
 		++haakjes; ++p;
 	}
 	CStructureEntry2* ip = mbf;
-	while (ip) {
+	Relocation::isResultAffected = false;
+	while (ip || 0 < haakjes) {
+		// check if inside curly braces block, and input seems to be empty -> fetch next line
+		if (0 < haakjes && !PrepareNonBlankMultiLine(p)) break;
+		if (nullptr == ip) {	// no more struct members expected, looking for closing '}'
+			assert(0 < haakjes);
+			if (!need(p, '}')) break;
+			--haakjes;
+			continue;
+		}
+		assert(ip);
 		switch (ip->type) {
 		case SMEMBBLOCK:
 			EmitBlock(ip->def != -1 ? ip->def : 0, ip->len, ip->def == -1, 8);
+			if (8 < ip->len) {	// "..." elipsis happened in listing, force listing
+				ListFile();
+				ListAddress = CurAddress;	// and fix listing address for following byte-listing
+			}
 			break;
 		case SMEMBBYTE:
 			EmitByte(ip->ParseValue(p));
 			if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(p);
 			break;
 		case SMEMBWORD:
+			// ParseValue will also add relocation data if needed (so the "ParseValue" name is misleading)
 			EmitWord(ip->ParseValue(p));
 			if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(p);
 			break;
@@ -1181,6 +1286,18 @@ void CStructure::emitmembs(char*& p) {
 			val = ip->ParseValue(p);
 			EmitWord(val & 0xFFFF);
 			EmitWord((val>>16) & 0xFFFF);
+			if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(p);
+			break;
+		case SMEMBTEXT:
+			{
+				if (nullptr == emitTextBuffer) {
+					emitTextBuffer = new byte[CStructureEntry2::TEXT_MAX_SIZE+2];
+					if (nullptr == emitTextBuffer) ErrorOOM();
+				}
+				memset(emitTextBuffer, 0, ip->len);
+				GetStructText(p, ip->len, emitTextBuffer, ip->text);
+				for (aint ii = 0; ii < ip->len; ++ii) EmitByte(emitTextBuffer[ii]);
+			}
 			if (ip->next && SMEMBPARENCLOSE != ip->next->type) anyComma(p);
 			break;
 		case SMEMBPARENOPEN:
@@ -1199,10 +1316,12 @@ void CStructure::emitmembs(char*& p) {
 		}
 		ip = ip->next;
 	}
-	while (haakjes--) {
-		if (!need(p, '}')) Error("closing } missing");
+	if (haakjes) {
+		Error("closing } missing");
 	}
 	if (!SkipBlanks(p)) Error("[STRUCT] Syntax error - too many arguments?");
+	Relocation::checkAndWarn();
+	if (nullptr != emitTextBuffer) delete[] emitTextBuffer;
 }
 
 CStructureTable::CStructureTable() {
@@ -1234,7 +1353,7 @@ CStructure* CStructureTable::Add(char* naam, int no, int gl) {
 	}
 	strs[(*sp)&127] = new CStructure(naam, sp, 0, gl, strs[(*sp)&127]);
 	if (no) {
-		strs[(*sp)&127]->AddMember(new CStructureEntry2(0, no, -1, SMEMBBLOCK));
+		strs[(*sp)&127]->AddMember(new CStructureEntry2(0, no, -1, false, SMEMBBLOCK));
 	}
 	return strs[(*sp)&127];
 }
@@ -1287,7 +1406,11 @@ int CStructureTable::Emit(char* naam, char* l, char*& p, int gl) {
 	if (!st) return 0;
 	// create new labels corresponding to current/designed address
 	aint address = CStructureTable::ParseDesignedAddress(p);
-	if (l) st->emitlab(l, (INT_MAX == address) ? CurAddress : address);
+	if (l) {
+		const bool isRelocatable =
+			(INT_MAX == address) ? Relocation::isActive : Relocation::isResultAffected && Relocation::isRelocatable;
+		st->emitlab(l, (INT_MAX == address) ? CurAddress : address, isRelocatable);
+	}
 	if (INT_MAX == address) st->emitmembs(p);	// address was not designed, emit also bytes
 	else if (!l) Warning("[STRUCT] designed address without label = no effect");
 	return 1;

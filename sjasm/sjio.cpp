@@ -64,9 +64,9 @@ static void initErrorLine() {		// adds filename + line of definition if possible
 	TextFilePos errorPos = DefinitionPos.line ? DefinitionPos : CurSourcePos;
 	bool isEmittedMsgEnabled = true;
 #ifdef USE_LUA
+	lua_Debug ar;					// must be in this scope, as some memory is reused by errorPos
 	if (LuaStartPos.line) {
 		errorPos = LuaStartPos;
-		lua_Debug ar;
 
 		// find either top level of lua stack, or standalone file, otherwise it's impossible
 		// to precisely report location of error (ASM can have 2+ LUA blocks defining functions)
@@ -235,13 +235,14 @@ void CheckRamLimitExceeded() {
 	char buf[64];
 	if (CurAddress >= 0x10000) {
 		if (LASTPASS == pass && notWarnedCurAdr) {
-			SPRINTF2(buf, 64, "RAM limit exceeded 0x%X by %s", (unsigned int)CurAddress, PseudoORG ? "DISP":"ORG");
+			SPRINTF2(buf, 64, "RAM limit exceeded 0x%X by %s",
+					 (unsigned int)CurAddress, DISP_NONE != PseudoORG ? "DISP":"ORG");
 			Warning(buf);
 			notWarnedCurAdr = false;
 		}
-		if (PseudoORG) CurAddress &= 0xFFFF;	// fake DISP address gets auto-wrapped FFFF->0
+		if (DISP_NONE != PseudoORG) CurAddress &= 0xFFFF;	// fake DISP address gets auto-wrapped FFFF->0
 	} else notWarnedCurAdr = true;
-	if (PseudoORG && adrdisp >= 0x10000) {
+	if (DISP_NONE != PseudoORG && adrdisp >= 0x10000) {
 		if (LASTPASS == pass && notWarnedDisp) {
 			SPRINTF1(buf, 64, "RAM limit exceeded 0x%X by ORG", (unsigned int)adrdisp);
 			Warning(buf);
@@ -314,8 +315,7 @@ void PrepareListLine(char* buffer, aint hexadd)
 	int digit = ' ';
 	int linewidth = reglenwidth;
 	aint linenumber = CurSourcePos.line % 10000;
-	if (linewidth > 5)
-	{
+	if (5 <= linewidth) {		// five-digit number, calculate the leading "digit"
 		linewidth = 5;
 		digit = CurSourcePos.line / 10000 + '0';
 		if (digit > '~') digit = '~';
@@ -353,6 +353,8 @@ FILE* GetListingFile() {
 	return NULL;
 }
 
+static aint lastListedLine = -1;
+
 void ListFile(bool showAsSkipped) {
 	if (LASTPASS != pass || NULL == GetListingFile() || donotlist || Options::syx.IsListingSuspended) {
 		donotlist = nListBytes = 0;
@@ -362,7 +364,9 @@ void ListFile(bool showAsSkipped) {
 	do {
 		if (showAsSkipped) substitutedLine = line;	// override substituted lines in skipped mode
 		PrepareListLine(pline, ListAddress);
-		if (pos) pline[24] = 0;		// remove source line on sub-sequent list-lines
+		const bool hideSource = !showAsSkipped && (lastListedLine == CompiledCurrentLine);
+		if (hideSource) pline[24] = 0;				// hide *same* source line on sub-sequent list-lines
+		lastListedLine = CompiledCurrentLine;		// remember this line as listed
 		char* pp = pline + 10;
 		int BtoList = (nListBytes < 4) ? nListBytes : 4;
 		for (int i = 0; i < BtoList; ++i) {
@@ -383,6 +387,7 @@ void ListFile(bool showAsSkipped) {
 void ListSilentOrExternalEmits() {
 	// catch silent/external emits like "sj.add_byte(0x123)" from Lua script
 	if (0 == nListBytes) return;		// no silent/external emit happened
+	++CompiledCurrentLine;
 	char silentOrExternalBytes[] = "; these bytes were emitted silently/externally (lua script?)";
 	substitutedLine = silentOrExternalBytes;
 	eolComment = nullptr;
@@ -415,7 +420,7 @@ static void EmitByteNoListing(int byte, bool preserveDeviceMemory = false) {
 		CheckRamLimitExceeded();
 	}
 	++CurAddress;
-	if (PseudoORG) ++adrdisp;
+	if (DISP_NONE != PseudoORG) ++adrdisp;
 }
 
 void EmitByte(int byte) {
@@ -451,7 +456,7 @@ void EmitWords(int* words) {
 void EmitBlock(aint byte, aint len, bool preserveDeviceMemory, int emitMaxToListing) {
 	if (len <= 0) {
 		CurAddress = (CurAddress + len) & 0xFFFF;
-		if (PseudoORG) adrdisp = (adrdisp + len) & 0xFFFF;
+		if (DISP_NONE != PseudoORG) adrdisp = (adrdisp + len) & 0xFFFF;
 		if (DeviceID)	Device->CheckPage(CDevice::CHECK_NO_EMIT);
 		else			CheckRamLimitExceeded();
 		return;
@@ -557,7 +562,7 @@ void BinIncFile(char* fname, int offset, int length) {
 			}
 			length -= advanceLength;
 			if (length <= 0 && 0 == advanceLength) Error("BinIncFile internal error", NULL, FATAL);
-			if (PseudoORG) adrdisp = adrdisp + advanceLength;
+			if (DISP_NONE != PseudoORG) adrdisp = adrdisp + advanceLength;
 			CurAddress = CurAddress + advanceLength;
 		}
 	} else {
@@ -803,8 +808,14 @@ void ReadBufLine(bool Parse, bool SplitByColon) {
 				continue;
 			}
 			// check if still in label area, if yes, copy the finishing colon as char (don't split by it)
-			if ((IsLabel = IsLabel && islabchar(*rlppos))) {
+			if ((IsLabel = (IsLabel && islabchar(*rlppos)))) {
 				++rlppos;					// label character
+				//SMC offset handling
+				if (ReadBufData() && '+' == *rlpbuf) {	// '+' after label, add it as SMC_offset syntax
+					IsLabel = false;
+					*rlppos++ = *rlpbuf++;
+					if (ReadBufData() && isdigit(byte(*rlpbuf))) *rlppos++ = *rlpbuf++;
+				}
 				if (ReadBufData() && ':' == *rlpbuf) {	// colon after label, add it
 					*rlppos++ = *rlpbuf++;
 					IsLabel = false;
@@ -1167,18 +1178,22 @@ EReturn ReadFile() {
 	while (ReadLine()) {
 		const bool isInsideDupCollectingLines = !RepeatStack.empty() && !RepeatStack.top().IsInWork;
 		if (!isInsideDupCollectingLines) {
+			// check for ending of IF/IFN/... block (keywords: ENDIF, ELSE and ELSEIF)
 			char* p = line;
 			SkipBlanks(p);
 			if ('.' == *p) ++p;
-			if (cmphstr(p, "endif")) {
-				lp = ReplaceDefine(p);
-				substitutedLine = line;		// override substituted listing for ENDIF
-				return ENDIF;
-			} else if (cmphstr(p, "else")) {
-				lp = ReplaceDefine(p);
-				substitutedLine = line;		// override substituted listing for ELSE
-				ListFile();
-				return ELSE;
+			EReturn retVal = END;
+			if (cmphstr(p, "elseif")) retVal = ELSEIF;
+			if (cmphstr(p, "else")) retVal = ELSE;
+			if (cmphstr(p, "endif")) retVal = ENDIF;
+			if (END != retVal) {
+				// one of the end-block keywords was found, don't parse it as regular line
+				// but just substitute the rest of it and return end value of the keyword
+				++CompiledCurrentLine;
+				lp = ReplaceDefine(p);		// skip any empty substitutions and comments
+				substitutedLine = line;		// for listing override substituted line with source
+				if (ENDIF != retVal) ListFile();	// do the listing for ELSE and ELSEIF
+				return retVal;
 			}
 		}
 		ParseLineSafe();
@@ -1200,16 +1215,26 @@ EReturn SkipFile() {
 			if (iflevel) {
 				--iflevel;
 			} else {
-				lp = ReplaceDefine(p);
+				++CompiledCurrentLine;
+				lp = ReplaceDefine(p);		// skip any empty substitutions and comments
 				substitutedLine = line;		// override substituted listing for ENDIF
 				return ENDIF;
 			}
 		} else if (cmphstr(p, "else")) {
 			if (!iflevel) {
-				lp = ReplaceDefine(p);
+				++CompiledCurrentLine;
+				lp = ReplaceDefine(p);		// skip any empty substitutions and comments
 				substitutedLine = line;		// override substituted listing for ELSE
 				ListFile();
 				return ELSE;
+			}
+		} else if (cmphstr(p, "elseif")) {
+			if (!iflevel) {
+				++CompiledCurrentLine;
+				lp = ReplaceDefine(p);		// skip any empty substitutions and comments
+				substitutedLine = line;		// override substituted listing for ELSEIF
+				ListFile();
+				return ELSEIF;
 			}
 		}
 		ListFile(true);
@@ -1241,6 +1266,7 @@ int ReadFileToCStringsList(CStringsList*& f, const char* end) {
 	// f itself should be already NULL, not resetting it here
 	CStringsList** s = &f;
 	while (ReadLineNoMacro()) {
+		++CompiledCurrentLine;
 		char* p = line;
 		SkipBlanks(p);
 		if ('.' == *p) ++p;

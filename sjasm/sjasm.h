@@ -86,6 +86,10 @@ namespace Options {
 	extern bool IsLR35902;			// "Sharp LR35902" CPU mode (must be set at CLI, blocks others)
 	extern bool IsLongPtr;
 
+	// emit virtual labels in LABELSLIST, that have only 64ki address and no page
+	// format is then `:ADDR label`, starting from colon, then 16bit address, then label.
+	extern bool EmitVirtualLabels;
+
 	extern CStringsList* IncludeDirsList;
 	extern CDefineTable CmdDefineTable;
 
@@ -129,9 +133,12 @@ typedef struct SSource {
 extern std::vector<SSource> sourceFiles;
 extern std::vector<std::string> openedFileNames;	// archive of all files opened (also includes!) (fullname!)
 
+enum EDispMode { DISP_NONE = 0, DISP_ACTIVE = 1, DISP_INSIDE_RELOCATE = 2 };
+extern EDispMode PseudoORG;
+
 extern int ConvertEncoding;
 extern int pass, IsLabelNotFound, ErrorCount, WarningCount, IncludeLevel, IsRunning, donotlist, listmacro;
-extern int adrdisp, PseudoORG, dispPageNum, StartAddress;
+extern int adrdisp, dispPageNum, StartAddress;
 extern byte* MemoryPointer;
 extern int macronummer, lijst, reglenwidth;
 extern TextFilePos CurSourcePos, DefinitionPos;

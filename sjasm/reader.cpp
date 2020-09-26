@@ -37,7 +37,7 @@ static const char delimiters_e[] = { ' ',    '"',       '\'',          '>',     
 static const std::array<EDelimiterType, 3> delimiters_all = {DT_QUOTES, DT_APOSTROPHE, DT_ANGLE};
 static const std::array<EDelimiterType, 3> delimiters_noAngle = {DT_QUOTES, DT_APOSTROPHE, DT_COUNT};
 
-int cmphstr(char*& p1, const char* p2) {
+int cmphstr(char*& p1, const char* p2, bool allowParenthesisEnd) {
 	unsigned int i = 0;
 	// check initial non-alpha chars without deciding the upper/lower case of test
 	while (p2[i] && !isalpha((byte)p2[i])) {
@@ -56,7 +56,19 @@ int cmphstr(char*& p1, const char* p2) {
 			++i;
 		}
 	}
-	if (p1[i] && !White(p1[i])) return 0;		// any character above space means "no match"
+	if (p1[i]) {		// there is some character after the first word
+		// whitespace, EOL-comment and block-comment-start keep the match valid
+		// also starting parenthesis when allowParenthesisEnd
+		if (
+			!White(p1[i]) && \
+			!(';' == p1[i]) && \
+			!('/' == p1[i] && '/' == p1[i+1]) && \
+			!('/' == p1[i] && '*' == p1[i+1]) && \
+			!(allowParenthesisEnd && '(' == p1[i])
+		) {
+			return 0;	// anything else invalidates the found match
+		}
+	}
 	// space, tab, enter, \0, ... => "match"
 	p1 += i;
 	return 1;
@@ -321,7 +333,9 @@ int check24(aint val) {
 }
 
 void checkLowMemory(byte hiByte, byte lowByte) {
-	if (hiByte || !warningNotSuppressed() || !Options::syx.IsLowMemWarningEnabled) {
+	if (hiByte || !Options::syx.IsLowMemWarningEnabled || !warningNotSuppressed() \
+		|| Relocation::isActive)
+	{
 		return;			// address is >= 256 or warning is suppressed
 	}
 	// for addresses 0..255 issue warning
@@ -338,18 +352,18 @@ int need(char*& p, char c) {
 	++p; return 1;
 }
 
-int needa(char*& p, const char* c1, int r1, const char* c2, int r2, const char* c3, int r3) {
+int needa(char*& p, const char* c1, int r1, const char* c2, int r2, const char* c3, int r3, bool allowParenthesisEnd) {
 	//  SkipBlanks(p);
 	if (!isalpha((byte)*p)) {
 		return 0;
 	}
-	if (cmphstr(p, c1)) {
+	if (cmphstr(p, c1, allowParenthesisEnd)) {
 		return r1;
 	}
-	if (c2 && cmphstr(p, c2)) {
+	if (c2 && cmphstr(p, c2, allowParenthesisEnd)) {
 		return r2;
 	}
-	if (c3 && cmphstr(p, c3)) {
+	if (c3 && cmphstr(p, c3, allowParenthesisEnd)) {
 		return r3;
 	}
 	return 0;
@@ -405,7 +419,7 @@ bool GetNumericValue_TwoBased(char*& p, const char* const pend, aint& val, const
 	}
 	aint digit;
 	const int base = 1<<shiftBase;
-	const aint overflowMask = (~0L)<<(32-shiftBase);
+	const aint overflowMask = (~0UL)<<(32-shiftBase);
 	while (p < pend) {
 		const byte charDigit = *p++;
 		if ('\'' == charDigit && isalnum((byte)*p)) continue;
@@ -588,7 +602,7 @@ int GetCharConst(char*& p, aint& val) {
 	int bytes = 0, strRes;
 	if (!(strRes = GetCharConstAsString(p, buffer, bytes))) return 0;		// no string detected
 	val = 0;
-	if (-1 == strRes) return 0;		// some syntax/max_size error happened
+	if (strRes < 0) return 0;		// some syntax/max_size error happened
 	for (int ii = 0; ii < bytes; ++ii) val = (val << 8) + (255&buffer[ii]);
 	if (0 == bytes) {
 		Warning("Empty string literal converted to value 0!", op);
@@ -603,7 +617,8 @@ int GetCharConst(char*& p, aint& val) {
 }
 
 // returns (adjusts also "p" and "ei", and fills "e"):
-//  -1 = syntax error (or buffer full)
+//  -2 = buffer full
+//  -1 = syntax error (missing quote/apostrophe)
 //   0 = no string literal detected at p[0]
 //   1 = string literal in single quotes (apostrophe)
 //   2 = string literal in double quotes (")
@@ -616,7 +631,8 @@ template <class strT> int GetCharConstAsString(char* & p, strT e[], int & ei, in
 		e[ei++] = (val + add) & 255;
 	}
 	if ((quotes ? '"' : '\'') != *p) {	// too many/invalid arguments or zero-terminator can lead to this
-		if (!*p) Error("Syntax error", elementP, SUPPRESS);
+		if (*p) return -2;				// too many arguments
+		Error("Syntax error", elementP, SUPPRESS);	// zero-terminator
 		return -1;
 	}
 	++p;
@@ -630,6 +646,8 @@ template int GetCharConstAsString<int>(char* & p, int e[], int & ei, int max_ei,
 int GetBytes(char*& p, int e[], int add, int dc) {
 	aint val;
 	int t = 0, strRes;
+	// reset alternate result flag in ParseExpression part of code
+	Relocation::isResultAffected = false;
 	do {
 		const int oldT = t;
 		char* const oldP = p;
@@ -639,7 +657,7 @@ int GetBytes(char*& p, int e[], int add, int dc) {
 		}
 		if (0 != (strRes = GetCharConstAsString(p, e, t, 128, add))) {
 			// string literal parsed (both types)
-			if (-1 == strRes) break;		// syntax error happened
+			if (strRes < 0) break;		// syntax error happened
 			// single byte "strings" may have further part of expression, detect it here
 			if (1 == t - oldT && !SkipBlanks(p) && ',' != *p) {
 				// expression with single char detected (like 'a'|128), revert the string parsing
@@ -665,9 +683,75 @@ int GetBytes(char*& p, int e[], int add, int dc) {
 			break;
 		}
 	} while(comma(p) && t < 128);
+	Relocation::checkAndWarn();
 	e[t] = -1;
 	if (t == 128 && *p) Error("Over 128 bytes defined in single DB/DC/... Values over", p, SUPPRESS);
 	return t;
+}
+
+void GetStructText(char*& p, aint len, byte* data, const byte* initData) {
+	assert(1 <= len && len <= CStructureEntry2::TEXT_MAX_SIZE && nullptr != data);
+	// reset alternate result flag in ParseExpression part of code
+	Relocation::isResultAffected = false;
+	// "{}" is always required to keep the syntax less ambiguous
+	// (prototype code was trying to be more relaxed, but it was quickly becoming too complicated)
+	// (the relaxed sub-struct boundaries are confusing, eating "{}" a bit unexpectedly (to user))
+	if (!need(p, '{')) {
+		if (nullptr == initData) {
+			Error("TEXT field value must be enclosed in curly braces, missing '{'", p);
+		} else {
+			memcpy(data, initData, len);
+		}
+		return;
+	}
+	aint ii = 0, val;
+	do {
+		// if no more chars/lines to be parsed, or ending curly brace incoming, finish the loop
+		if (!PrepareNonBlankMultiLine(p) || '}' == *p) break;
+		const int oldIi = ii;
+		char* const oldP = p;
+		int strRes;
+		if (0 < (strRes = GetCharConstAsString(p, data, ii, len))) {
+			// string literal parsed (both types)
+			// single byte "strings" may have further part of expression, detect it here
+			if (1 == ii - oldIi && !SkipBlanks(p) && ',' != *p && '}' != *p) {
+				// expression with single char detected (like 'a'|128), revert the string parsing
+				ii = oldIi;
+				p = oldP;		// and continue with the last code-path trying to parse expression
+			} else {			// string literal (not expression) parsed OK
+				continue;
+			}
+		}
+		if (-1 == strRes) break;		// syntax error happened
+		if (-2 == strRes || len <= ii) {
+			Error("Maximum length of struct text reached. Values over", p, SUPPRESS);
+			break;
+		}
+		if (ParseExpressionNoSyntaxError(p, val)) {
+			check8(val);
+			data[ii++] = byte(val);
+		} else {
+			Error("Syntax error", p, SUPPRESS);
+			break;
+		}
+	} while (comma(p));
+	if (!PrepareNonBlankMultiLine(p) || !need(p, '}')) {
+		Error("TEXT field value must be enclosed in curly braces, missing '}'", p);
+		return;
+	}
+	Relocation::checkAndWarn();
+	// some bytes were initialized explicitly
+	if (nullptr != initData) {
+		// init remaining bytes from initData
+		while (ii < len) {
+			data[ii] = initData[ii];
+			++ii;
+		}
+	} else {
+		// init remaining bytes by last byte (or zero if none was defined)
+		byte filler = 0 < ii ? data[ii - 1] : 0;
+		while (ii < len) data[ii++] = filler;
+	}
 }
 
 int GetBits(char*& p, int e[]) {
@@ -866,6 +950,10 @@ EStructureMembers GetStructMemberId(char*& p) {
 	case 'D'*2+'2':
 		if (cmphstr(p, "d24")) return SMEMBD24;
 		break;
+	case 't'*2+'e':
+	case 'T'*2+'E':
+		if (cmphstr(p, "text")) return SMEMBTEXT;
+		break;
 	default:
 		break;
 	}
@@ -875,6 +963,7 @@ EStructureMembers GetStructMemberId(char*& p) {
 int GetMacroArgumentValue(char* & src, char* & dst) {
 	SkipBlanks(src);
 	const char* const dstOrig = dst, * const srcOrig = src;
+	const char* dstStopTrim = dst;
 	while (*src && ',' != *src) {
 		// check if there is some kind of delimiter next (string literal or angle brackets expression)
 		// the angle-bracket can only be used around whole argument (i.e. '<' must be first char)
@@ -935,8 +1024,10 @@ int GetMacroArgumentValue(char* & src, char* & dst) {
 		}
 		// set ending delimiter for quotes and apostrophe (angles are stripped from value)
 		if (DT_QUOTES == delI || DT_APOSTROPHE == delI) *dst++ = endCh;
+		dstStopTrim = dst;						// should not trim right spaces beyond this point
 		++src;									// advance over delimiter
 	}
+	while (dstStopTrim < dst && White(dst[-1])) --dst;	// trim the right size space from value
 	*dst = 0;									// zero terminator of resulting string value
 	if (! *dstOrig) Warning("[Macro argument parser] empty value", srcOrig);
 	return 1;
