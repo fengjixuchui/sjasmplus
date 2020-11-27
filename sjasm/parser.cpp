@@ -674,6 +674,7 @@ void ParseLabel() {
 		}
 		// Copy label name to last parsed label variable
 		if (!IsDEFL) SetLastParsedLabel(tp);
+		unsigned traits = (IsEQU ? LABEL_IS_EQU : 0) | (IsDEFL ? LABEL_IS_DEFL : 0);
 		if (pass == LASTPASS) {
 
 			CLabelTableEntry* label = LabelTable.Find(tp, true);
@@ -682,10 +683,11 @@ void ParseLabel() {
 				return;
 			}
 			if (IsDEFL) {		//re-set DEFL value
-				LabelTable.Insert(tp, val, false, true);
+				LabelTable.Insert(tp, val, traits);
 			} else if (IsSldExportActive()) {
 				// SLD (Source Level Debugging) tracing-data logging
-				WriteToSldFile(IsEQU ? -1 : label->page, val, IsEQU ? 'D' : 'F', tp);
+				WriteToSldFile(IsEQU ? -1 : label->page, val, IsEQU ? 'D' : 'F', tp);	//version 0
+				WriteToSldFile(IsEQU ? -1 : label->page, val, 'L', ExportLabelToSld(ttp, label));	//version 1
 			}
 
 			if (val != label->value) {
@@ -697,13 +699,12 @@ void ParseLabel() {
 
 				delete[] buf;
 			}
-		} else if (pass == 2 && !LabelTable.Insert(tp, val, false, IsDEFL, IsEQU, equPageNum) && !LabelTable.Update(tp, val)) {
+		} else if (pass == 2 && !LabelTable.Insert(tp, val, traits, equPageNum) && !LabelTable.Update(tp, val)) {
 			Error("Duplicate label", tp, EARLY);
-		} else if (pass == 1 && !LabelTable.Insert(tp, val, false, IsDEFL, IsEQU, equPageNum)) {
+		} else if (pass == 1 && !LabelTable.Insert(tp, val, traits, equPageNum)) {
 			Error("Duplicate label", tp, EARLY);
 		}
 
-// TODO v2.x: currently DEFL+EQU label can be followed with instruction => remove this syntax
 // TODO v2.x: this is too complicated in current version: Unreal/Cspect already expect
 // EQU/DEFL to be current page or "ROM" = not a big deal as they did change in v1.x course already.
 // But also struct labels are set as EQU ones, so this has to split, and many other details.
@@ -756,32 +757,9 @@ int ParseMacro() {
 	return 0;
 }
 
-static bool PageDiffersWarningShown = false;
-
 void ParseInstruction() {
 	if ('@' == *lp) ++lp;		// skip single '@', if it was used to inhibit macro expansion
-	if (ParseDirective()) {
-		return;
-	}
-
-	// SLD (Source Level Debugging) tracing-data logging
-	if (IsSldExportActive()) {
-		int pageNum = Page->Number;
-		if (DISP_NONE != PseudoORG) {
-			int mappingPageNum = Device->GetPageOfA16(CurAddress);
-			if (LABEL_PAGE_UNDEFINED == dispPageNum) {	// special DISP page is not set, use mapped
-				pageNum = mappingPageNum;
-			} else {
-				pageNum = dispPageNum;					// special DISP page is set, use it instead
-				if (pageNum != mappingPageNum && !PageDiffersWarningShown) {
-					Warning("DISP memory page differs from current mapping");
-					PageDiffersWarningShown = true;		// show warning about different mapping only once
-				}
-			}
-		}
-		WriteToSldFile(pageNum, CurAddress);
-	}
-
+	if (ParseDirective()) return;
 	Z80::GetOpCode();
 }
 
@@ -866,6 +844,8 @@ bool PrepareNonBlankMultiLine(char*& p) {
 void ParseLine(bool parselabels) {
 
 	if (PrepareLine()) return;
+
+	if (eolComment && IsSldExportActive()) SldTrackComments();
 
 	if (!*lp) {
 		char *srcNonWhiteChar = line;

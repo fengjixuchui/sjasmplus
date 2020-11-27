@@ -106,6 +106,45 @@ char* ValidateLabel(const char* naam, bool setNameSpace) {
 	return label;
 }
 
+static char sldLabelExport[2*LINEMAX];
+
+char* ExportLabelToSld(const char* naam, const CLabelTableEntry* label) {
+	// does re-parse the original source line again similarly to ValidateLabel
+	// but prepares SLD 'L'-type line, with module/main/local comma separated + usage traits info
+	assert(nullptr != label);
+	assert(isLabelStart(naam));		// this should be called only when ValidateLabel did succeed
+	const bool global = '@' == *naam;
+	const bool local = '.' == *naam;
+	if (global || local) ++naam;	// single modifier is parsed
+	const bool inMacro = local && macrolabp;
+	const bool inModule = !inMacro && !global && ModuleName[0];
+	// build fully qualified SLD info
+	sldLabelExport[0] = 0;
+	// module part
+	if (inModule) STRCAT(sldLabelExport, LINEMAX, ModuleName);
+	STRCAT(sldLabelExport, 2, ",");
+	// main label part (the `vorlabp` is already the current label, if it was main label)
+	STRCAT(sldLabelExport, LABMAX, inMacro ? macrolabp : vorlabp);
+	STRCAT(sldLabelExport, 2, ",");
+	// local part
+	if (local) STRCAT(sldLabelExport, LABMAX, naam);
+	// usage traits
+	if (label->IsEQU) STRCAT(sldLabelExport, 20, ",+equ");
+	if (inMacro) STRCAT(sldLabelExport, 20, ",+macro");
+	if (label->isRelocatable) STRCAT(sldLabelExport, 20, ",+reloc");
+	if (label->used) STRCAT(sldLabelExport, 20, ",+used");
+	if (label->isStructDefinition) STRCAT(sldLabelExport, 20, ",+struct_def");
+	if (label->isStructEmit) STRCAT(sldLabelExport, 20, ",+struct_data");
+	return sldLabelExport;
+}
+
+char* ExportModuleToSld(bool endModule) {
+	assert(ModuleName[0]);
+	STRNCPY(sldLabelExport, 2*LINEMAX, ModuleName, LINEMAX);
+	STRCAT(sldLabelExport, LINEMAX-1, endModule ? ",,,+endmod" : ",,,+module");
+	return sldLabelExport;
+}
+
 static bool getLabel_invalidName = false;
 
 static CLabelTableEntry* GetLabel(char*& p) {
@@ -159,7 +198,7 @@ static CLabelTableEntry* GetLabel(char*& p) {
 		// canonical name is either in "temp" (when in-macro) or in "fullName" (outside macro)
 		findName = temp[0] ? temp : fullName.get();
 		if (!inTableAlready) {
-			LabelTable.Insert(findName, 0, true);
+			LabelTable.Insert(findName, 0, LABEL_IS_UNDEFINED);
 			IsLabelNotFound = 1;
 		} else {
 			IsLabelNotFound = 2;
@@ -221,7 +260,7 @@ void CLabelTableEntry::ClearData() {
 	value = 0;
 	updatePass = 0;
 	page = LABEL_PAGE_UNDEFINED;
-	IsDEFL = IsEQU = used = isRelocatable = false;
+	IsDEFL = IsEQU = used = isRelocatable = isStructDefinition = isStructEmit = false;
 }
 
 CLabelTableEntry::CLabelTableEntry() : name(NULL) {
@@ -254,14 +293,18 @@ static short getAddressPageNumber(const aint address, bool forceRecalculateByAdd
 	return page;
 }
 
-int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsDEFL, bool IsEQU, short equPageNum) {
+int CLabelTable::Insert(const char* nname, aint nvalue, unsigned traits, short equPageNum) {
 	if (NextLocation >= LABTABSIZE * 2 / 3) {
 		Error("Label table full", NULL, FATAL);
 	}
+	const bool IsDEFL = !!(traits & LABEL_IS_DEFL);
+	const bool IsEQU = !!(traits & LABEL_IS_EQU);
+	const bool IsDeflEqu = IsDEFL || IsEQU;
+	const bool IsUndefined = !!(traits & LABEL_IS_UNDEFINED);
 
 	// the EQU/DEFL is relocatable when the expression itself is relocatable
 	// the regular label is relocatable when relocation is active
-	const bool isRelocatable = (IsDEFL || IsEQU) ? \
+	const bool isRelocatable = IsDeflEqu ? \
 			Relocation::isResultAffected && Relocation::isRelocatable : \
 			Relocation::isActive && DISP_INSIDE_RELOCATE != PseudoORG;
 	// Find label in label table
@@ -275,11 +318,13 @@ int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsD
 			if (IsEQU && LABEL_PAGE_UNDEFINED != equPageNum) {
 				label->page = equPageNum;
 			} else {
-				label->page = getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+				label->page = getAddressPageNumber(nvalue, IsDeflEqu);
 			}
 			label->IsDEFL = IsDEFL;
 			label->IsEQU = IsEQU;
 			label->isRelocatable = isRelocatable;
+			label->isStructDefinition = !!(traits & LABEL_IS_STRUCT_D);
+			label->isStructEmit = !!(traits & LABEL_IS_STRUCT_E);
 			label->updatePass = pass;
 			return 1;
 		}
@@ -294,15 +339,17 @@ int CLabelTable::Insert(const char* nname, aint nvalue, bool undefined, bool IsD
 	if (label->name == NULL) ErrorOOM();
 	label->IsDEFL = IsDEFL;
 	label->IsEQU = IsEQU;
+	label->isStructDefinition = !!(traits & LABEL_IS_STRUCT_D);
+	label->isStructEmit = !!(traits & LABEL_IS_STRUCT_D);
 	label->updatePass = pass;
 	label->value = nvalue;
-	label->used = undefined;
+	label->used = IsUndefined;
 	if (IsEQU && LABEL_PAGE_UNDEFINED != equPageNum) {
 		label->page = equPageNum;
 	} else {
-		label->page = undefined ? LABEL_PAGE_UNDEFINED : getAddressPageNumber(nvalue, IsDEFL|IsEQU);
+		label->page = IsUndefined ? LABEL_PAGE_UNDEFINED : getAddressPageNumber(nvalue, IsDEFL|IsEQU);
 	}
-	label->isRelocatable = !undefined && isRelocatable;		// ignore "relocatable" for "undefined"
+	label->isRelocatable = !IsUndefined && isRelocatable;	// ignore "relocatable" for "undefined"
 	return 1;
 }
 
@@ -429,6 +476,15 @@ void CLabelTable::DumpForCSpect() {
 			LabelTable[i].IsDEFL ? 2 :
 			(LABEL_PAGE_ROM <= LabelTable[i].page) ? 3 : 0;
 		const short page = labelType ? 0 : LabelTable[i].page;
+			// TODO:
+			// page == -1 will put regular EQU like "BLUE" out of reach for disassembly window
+			// (otherwise BLUE becomes label for address $C001 with default mapping)
+			// BUT then it would be nice to provide real page data for equ which have them explicit
+			// BUT I can't distinguish explicit/implicit page number, as there's heuristic to use current mapping
+			// instead of using the LABEL_PAGE_OUT_OF_BOUNDS page number...
+			// TODO: figure out when/why the implicit page number heuristic happenned and if you can detect
+			// only explicit page numbers used in EQU, and export only those
+
 		const aint longAddress = (PAGE_MASK & LabelTable[i].value) + page * PAGE_SIZE;
 		fprintf(file, "%08X %08X %02X ", 0xFFFF & LabelTable[i].value, longAddress, labelType);
 		// convert primary+local label to be "@" delimited (not "." delimited)
@@ -447,6 +503,9 @@ void CLabelTable::DumpForCSpect() {
 				--localLabelStart;			// and look for next dot
 			} while (temp < localLabelStart && '.' != *localLabelStart);
 		}
+		// convert whole label to upper-case, as CSpect search is malfunctioning otherwise.
+		char* strToUpper = temp;
+		while ((*strToUpper = (char) toupper((byte)*strToUpper))) { ++strToUpper; }
 		fprintf(file, "%s\n", temp);
 	}
 	fclose(file);
@@ -458,17 +517,8 @@ void CLabelTable::DumpSymbols() {
 		Error("Error opening file", Options::SymbolListFName, FATAL);
 	}
 	for (int i = 1; i < NextLocation; ++i) {
-		if (LabelTable[i].name && isalpha((byte)LabelTable[i].name[0])) {
-			STRCPY(temp, LINEMAX-2, LabelTable[i].name);
-			STRCAT(temp, LINEMAX-1, ": equ ");
-			STRCAT(temp, LINEMAX-1, "0x");
-			char lnrs[16], * l = lnrs;
-			PrintHex32(l, LabelTable[i].value);
-			*l = 0;
-			STRCAT(temp, LINEMAX-1, lnrs);
-			STRCAT(temp, LINEMAX-1, "\n");
-			fputs(temp, symfp);
-		}
+		if (!LabelTable[i].name || !isalpha((byte)LabelTable[i].name[0])) continue;
+		WriteLabelEquValue(LabelTable[i].name, LabelTable[i].value, symfp);
 	}
 	fclose(symfp);
 }
@@ -1182,7 +1232,7 @@ void CStructure::CopyMembers(CStructure* st, char*& lp) {
 	AddMember(new CStructureEntry2(noffset, 0, 0, false, SMEMBPARENCLOSE));
 }
 
-static void InsertSingleStructLabel(char *name, const bool isRelocatable, const aint value) {
+static void InsertSingleStructLabel(char *name, const bool isRelocatable, const aint value, const bool isDefine = true) {
 	char *op = name;
 	std::unique_ptr<char[]> p(ValidateLabel(op, true));
 	if (!p) {
@@ -1197,26 +1247,41 @@ static void InsertSingleStructLabel(char *name, const bool isRelocatable, const 
 		if (value != oval) {
 			Error("Label has different value in pass 2", p.get());
 		}
+		if (IsSldExportActive()) {		// SLD (Source Level Debugging) tracing-data logging
+			CLabelTableEntry* label = LabelTable.Find(p.get(), true);
+			assert(label);		// should have been already defined before last pass
+			if (label) WriteToSldFile(isDefine ? -1 : label->page, value, 'L', ExportLabelToSld(name, label));
+		}
 	} else {
 		Relocation::isResultAffected = Relocation::isRelocatable = isRelocatable;
-		if (!LabelTable.Insert(p.get(), value, false, false, true)) Error("Duplicate label", p.get(), EARLY);
+		unsigned traits = LABEL_IS_EQU|(isDefine ? LABEL_IS_STRUCT_D : LABEL_IS_STRUCT_E);
+		if (!LabelTable.Insert(p.get(), value, traits)) Error("Duplicate label", p.get(), EARLY);
 	}
 }
 
-static void InsertStructSubLabels(const char* mainName, const bool isRelocatable, const CStructureEntry1* members, const aint address = 0) {
+static void InsertStructSubLabels(const char* mainName, const bool isRelocatable, const CStructureEntry1* members, const aint address = 0, const bool isDefine = true) {
 	char ln[LINEMAX+1];
 	STRCPY(ln, LINEMAX, mainName);
 	char * const lnsubw = ln + strlen(ln);
 	while (members) {
 		STRCPY(lnsubw, LINEMAX-strlen(ln), members->naam);		// overwrite sub-label part
-		InsertSingleStructLabel(ln, isRelocatable, members->offset + address);
+		InsertSingleStructLabel(ln, isRelocatable, members->offset + address, isDefine);
 		members = members->next;
 	}
 }
 
 void CStructure::deflab() {
-	char sn[LINEMAX] = { '@' };
-	STRCPY(sn+1, LINEMAX-1, id);
+	const size_t moduleNameLength = strlen(ModuleName);
+	char sn[LINEMAX] = { '@', 0 };
+	if (moduleNameLength && (0 == strncmp(id, ModuleName, moduleNameLength)) \
+		&& ('.' == id[moduleNameLength]) && (id[moduleNameLength+1]))
+	{
+		// looks like the structure name starts with current module name, use non-global way then
+		STRCPY(sn, LINEMAX-1, id + moduleNameLength + 1);
+	} else {
+		// the structure name does not match current module, use the global "@id" way to define it
+		STRCPY(sn+1, LINEMAX-1, id);
+	}
 	InsertSingleStructLabel(sn, false, noffset);
 	STRCAT(sn, LINEMAX-1, ".");
 	InsertStructSubLabels(sn, false, mnf);
@@ -1232,11 +1297,11 @@ void CStructure::emitlab(char* iid, aint address, const bool isRelocatable) {
 					naam, maxAlignment, misalignment);
 		Warning(warnTxt);
 	}
-	char sn[LINEMAX];
+	char sn[LINEMAX] { 0 };
 	STRCPY(sn, LINEMAX-1, iid);
-	InsertSingleStructLabel(sn, isRelocatable, address);
+	InsertSingleStructLabel(sn, isRelocatable, address, false);
 	STRCAT(sn, LINEMAX-1, ".");
-	InsertStructSubLabels(sn, isRelocatable, mnf, address);
+	InsertStructSubLabels(sn, isRelocatable, mnf, address, false);
 }
 
 void CStructure::emitmembs(char*& p) {

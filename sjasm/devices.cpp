@@ -149,6 +149,13 @@ static void DeviceZxSpectrumNext(CDevice **dev, CDevice *parent, aint ramtop) {
 	}
 }
 
+static void DeviceNoSlot64k(CDevice **dev, CDevice *parent, aint ramtop) {
+	if (ramtop) Warning("NoSlot64k device doesn't init memory in any way (RAMTOP is ignored)");
+	*dev = new CDevice("NOSLOT64K", parent);
+	const int initialPages[] = { 0 };
+	initRegularSlotDevice(*dev, 0x10000, 1, 32, initialPages);	// 32*64kiB = 2MiB
+}
+
 int SetDevice(char *id, const aint ramtop) {
 	CDevice** dev;
 	CDevice* parent = nullptr;
@@ -185,6 +192,8 @@ int SetDevice(char *id, const aint ramtop) {
 				DeviceZXSpectrum8192(dev, parent, ramtop);
 			} else if (cmphstr(id, "zxspectrumnext")) {
 				DeviceZxSpectrumNext(dev, parent, ramtop);
+			} else if (cmphstr(id, "noslot64k")) {
+				DeviceNoSlot64k(dev, parent, ramtop);
 			} else {
 				return false;
 			}
@@ -196,6 +205,25 @@ int SetDevice(char *id, const aint ramtop) {
 	}
 	if (ramtop && Device->ZxRamTop && ramtop != Device->ZxRamTop) {
 		Warning("[DEVICE] this device was already opened with different RAMTOP value");
+	}
+	if (IsSldExportActive()) {
+		// SLD tracing data are being exported, export the device data
+		int pageSize = Device->GetCurrentSlot()->Size;
+		int pageCount = Device->PagesCount;
+		int slotsCount = Device->SlotsCount;
+		char buf[LINEMAX];
+		snprintf(buf, LINEMAX, "pages.size:%d,pages.count:%d,slots.count:%d",
+			pageSize, pageCount, slotsCount
+		);
+		for (int slotI = 0; slotI < slotsCount; ++slotI) {
+			size_t bufLen = strlen(buf);
+			char* bufAppend = buf + bufLen;
+			snprintf(bufAppend, LINEMAX-bufLen,
+						(0 == slotI) ? ",slots.adr:%d" : ",%d",
+						Device->GetSlot(slotI)->Address);
+		}
+		// pagesize
+		WriteToSldFile(-1,-1,'Z',buf);
 	}
 	return true;
 }
